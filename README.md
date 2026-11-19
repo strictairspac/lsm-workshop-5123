@@ -12,13 +12,14 @@
 - 层级配置：memtable 不同键容量、SSTable 合并触发数、层级上限、最终完整合并开关。
 - 合并队列：创建试验时持久化输入及配置快照，Redis 分发，独立 worker 执行并记录状态。
 - 读放大证据：显示合并前后层级、读写放大、真实存活键、Oracle 摘要、刷盘/合并轨迹、JSON 导出。
+- 空间回收方案：为批次刷出的最多 8 张表设置容量上限与收缩目标，按固定编码字节规划合并顺序；页面可推进合并、查看峰值与当前读值。
 - 管理员审计：记录写操作账号、路由与 HTTP 结果，包含权限拒绝。
 
 | 角色 | 页面与权限 | 典型动作 |
 |---|---|---|
-| admin 管理员 | 全业务页面与审计 | 登记批次/配置、执行、导出、查看审计 |
-| operator 操作员 | 四业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果 |
-| viewer 观察员 | 四业务页面只读与导出 | 阅读层级和 Oracle 证据，写请求在 API 层403 |
+| admin 管理员 | 五业务页面与审计 | 登记批次/配置、执行、导出、查看审计 |
+| operator 操作员 | 五业务页面，不可看管理员审计 | 新建输入与配置、提交 worker、检查与下载结果、推进空间回收 |
+| viewer 观察员 | 五业务页面只读与导出 | 阅读层级、Oracle 证据与空间方案，写请求在 API 层403 |
 
 ## 启动与账号
 
@@ -49,6 +50,8 @@ docker compose down -v --remove-orphans
 6. 09:25 打开读放大证据，确认早班输入最终6个存活键，sensor-02/03未复活。
 7. 09:30 下载 `lsm-trial-<id>.json`，包含操作/配置快照、层级、轨迹与校验和。
 8. 09:40 viewer复核，创建试验被403拒绝；10:00 admin检查操作审计。
+9. 09:45 站点磁盘告急：在“空间回收”选择早班批次，memtable容量2，设置容量上限411字节、收缩目标178字节，生成4步方案。
+10. 09:50 逐步推进；页面显示每步切换峰值（最高409字节）与当前读值，重试同一步只返回原进度、不重复占额。
 
 Seed另含“旧值复活回归集”和“全部删除边界集”；配置另含“保留层级观测”和“宽缓冲-完整合并”。账户、批次、配置以自然键查缺插入，重复seed不改变已存在字段。
 
@@ -67,6 +70,18 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 
 输出包括真实计算的层级表数/键范围/墓碑数、每步刷盘合并轨迹、输入键数、存活键、写出条目、读写放大、Oracle及实际键值、摘要。空输入和超限在提交时422，引用不存在404，重名409，排队/运行总数超过20时429；worker失败保存error和failed状态。
 
+## 空间回收规划（独立于原合并试验）
+
+原写入批次/配置/试验链路保持不变；空间回收是叠加的规划视图，不改写试验结果。
+
+- 输入：批次快照、memtable 不同键容量、容量上限字节、收缩目标字节。批次按容量刷出的表最多 8 张，超过 8 张提交时 422。
+- 字节口径固定为 `canonical-json-v1`：每张表按 `{"key":[seq,deleted,value],...}` 的 UTF-8 紧凑规范 JSON（键排序、无空格）计字节，空表 0 字节；不使用真实磁盘块、压缩或 Bloom 过滤。
+- 规划状态是刷出表的分区。一步合并替换其中若干张表为一张新表。新表落稳前新旧同占空间，因此该步峰值 = 当前总占用 + 新表字节；整条方案峰值取各步最大值。
+- 只有覆盖当前全部表的完整合并才允许清理墓碑（与原模型的最深完整合并规则一致）；任何局部合并都保留墓碑，避免误删仍遮着旧值的删除标记。
+- 生成方案时用 BFS 搜索可行合并顺序并按步数最短返回；若不存在满足“每步峰值 ≤ 容量上限且最终占用 ≤ 收缩目标”的顺序，返回 `feasible=false` 与具体原因（初始超限、目标低于最少字节等），不提供伪方案。
+- 推进接口 `POST /space-plans/{id}/advance` 带 `expected_step`。每一步在事务中重新校验步骤、输出字节、峰值与 Oracle 读值，全部一致才一次性切换；`expected_step` 小于当前进度视为已提交重试，只返回当前进度，不重复占额。进度、峰值与读值持久化在 MySQL，中断后从原进度续跑。
+- 页面 `/space`：登记限额、生成方案、逐步推进、查看当前表与读值（与最后写入 Oracle 的摘要一致）、每步峰值与峰值记录。
+
 ## 技术栈与代码组织
 
 | 服务 | 实现与作用 |
@@ -74,10 +89,10 @@ Seed另含“旧值复活回归集”和“全部删除边界集”；配置另�
 | frontend | 原生HTML/CSS/JS ES模块，Nginx1.27，土橙材料样本册视觉 |
 | backend | Python3.11、FastAPI、SQLAlchemy、PyMySQL、JWT与PBKDF2密码 |
 | worker | 独立Python进程，Redis BLPOP，LSM演算，数据库恢复队列，心跳健康检查 |
-| db | MySQL8.0，持久化3个业务实体、用户与审计 |
+| db | MySQL8.0，持久化4个业务实体、用户与审计 |
 | redis | Redis7，异步队列与持久卷 |
 
-`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema v1说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。
+`backend/src/`分为config/models/schemas/services/controllers/routes/middlewares/utils/constants；`backend/scripts/seed_demo.py`种子与初始化；`backend/migrations/README.md`为schema说明。3实体dataset/config/trial各自贯穿model/schema/service/route、前端api/store/page。试验结果保存在Trial JSON字段中，详情页为独立业务页面。空间回收另设SpacePlan实体（model/schema/service/route + 前端api/store/page）与纯算法模块`services/space_planner.py`，算法不依赖数据库。
 
 `frontend/src/`包含api/stores/types/components/common/hooks/pages/router/utils/constants，表格/状态/页头跨页共享，HTML转义与反馈工具复用。角色/任务状态/操作类型枚举在`backend/src/constants/enums.py`和`frontend/src/constants/enums.js`。模型默认任务状态使用后端枚举，前端状态组件使用前端枚举。
 
@@ -92,7 +107,10 @@ Docker恰好5服务，全部healthcheck；backend依赖db/redis healthy，worker
 - 存储过程为内存教学模型，忽略磁盘块、压缩、Bloom过滤器、WAL持久化、并行compaction与真实故障恢复。MySQL负责保存网页业务输入和输出。
 - 前端创建独立批次/配置，不提供原记录编辑删除；新版本新建记录，试验总是固定输入快照。
 - 最终全历史合并允许去掉墓碑；没有模拟跨副本历史/快照读，因此不能将该规则直接用于生产数据库。
-- 单worker与按钮刷新；不提供多worker分布式锁、SSE。
+- 单worker与按钮刷新；不提供多worker分布式锁、SSE。空间回收的推进用数据库行锁串行化单请求。
+- 空间回收只规划由 memtable 刷盘产生的表，最多 8 张；不模拟真实文件系统、块设备或在线流量。
 - Web双字体来自Google Fonts，离线回退到serif/monospace。
+
+测试：`cd backend && PYTHONPATH=. python3 -m unittest discover -s tests`（规划算法测试无需数据库；API 测试在缺少 FastAPI 等依赖时自动跳过）。
 
 MIT License，见LICENSE。实际测试与截图位于批次的`test-artifacts/gb-4106/`，源码内不保存测试证据。
